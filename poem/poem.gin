@@ -3,14 +3,14 @@ manualSeed = 1111
 dist = 'HVD'
 
 n_channels = 3
-o_classes = 92
+o_classes = 168
 
 GradCheck = 1
 
 # Parameters for get_images (ds_load.py):
 # ==============================================================================
 get_images.max_w = 1000
-get_images.max_h = 1400
+get_images.max_h = 1000
 get_images.nch = %n_channels
 
 # Parameters for SameTrCollate (ds_load.py):
