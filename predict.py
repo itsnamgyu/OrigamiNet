@@ -44,6 +44,7 @@ OnceExecWorker = None
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+
 def init_bn(model):
     if type(model) in [torch.nn.InstanceNorm2d, torch.nn.BatchNorm2d]:
         init.ones_(model.weight)
@@ -55,12 +56,13 @@ def init_bn(model):
 def WrkSeeder(_):
     return np.random.seed((torch.initial_seed()) % (2 ** 32))
 
+    
 @gin.configurable
 def train(opt, AMP, WdB, train_data_path, train_data_list, test_data_path, test_data_list, experiment_name, 
             train_batch_size, val_batch_size, workers, lr, valInterval, num_iter, wdbprj, continue_model=''):
 
     HVD3P = pO.HVD or pO.DDP
-
+    torch.cuda.set_device(-1)
     val_batch_size = 1
 
     if OnceExecWorker and WdB:
@@ -68,30 +70,12 @@ def train(opt, AMP, WdB, train_data_path, train_data_list, test_data_path, test_
         wandb.config.update(opt)
     
     train_dataset = ds_load.myLoadDS(train_data_list, train_data_path)
-    valid_dataset = ds_load.myLoadDS(test_data_list, test_data_path , ralph=train_dataset.ralph)
-
+   
     if opt.num_gpu > 1:
         workers = workers * ( 1 if HVD3P else opt.num_gpu )
 
-    if HVD3P:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=opt.world_size, rank=opt.rank)
-        valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset, num_replicas=opt.world_size, rank=opt.rank)
-
-    train_loader  = torch.utils.data.DataLoader( train_dataset, batch_size=train_batch_size, shuffle=False, 
-                    pin_memory = True, num_workers = int(workers),
-                    sampler = train_sampler if HVD3P else None,
-                    worker_init_fn = WrkSeeder,
-                    collate_fn = ds_load.SameTrCollate
-                )
-    valid_loader  = torch.utils.data.DataLoader( valid_dataset, batch_size=val_batch_size , pin_memory=True, 
-                    num_workers = int(workers), sampler=valid_sampler if HVD3P else None, shuffle=False)
-    
     model = OrigamiNet()
     model.apply(init_bn)
-    model.train()
-
-    biparams    = list(dict(filter(lambda kv: 'bias'     in kv[0], model.named_parameters())).values())
-    nonbiparams = list(dict(filter(lambda kv: 'bias' not in kv[0], model.named_parameters())).values())
 
     if not pO.DDP:
         model = model.to(device)
@@ -132,45 +116,9 @@ def train(opt, AMP, WdB, train_data_path, train_data_list, test_data_path, test_
 
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True).to(device)
     converter = CTCLabelConverter(train_dataset.ralph.values())
+    
+    return model, converter
 
-    start_time = time.time()
-    best_accuracy = -1
-    best_norm_ED = 1e+6
-    best_CER = 1e+6
-    i = 0
-    gAcc = 1
-    epoch = 1
-    btReplay = False and AMP
-    max_batch_replays = 1
-    data_dir = '/home/itsnamgyu/test'
-    transform = transforms.Compose([transforms.ToTensor()])
-    dataset = ds_load.myLoadDS('/home/itsnamgyu/test/random_list','/home/itsnamgyu/test/random_test/')
-
-    if HVD3P:
-        sampler = torch.utils.data.distributed.DistributedSampler(dataset, num_replicas=opt.world_size, rank=opt.rank)
-        valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset, num_replicas=opt.world_size, rank=opt.rank)
-
-    dataloader  = torch.utils.data.DataLoader(dataset, batch_size=1 , pin_memory=True, 
-                    num_workers = int(workers), sampler=None)
-
-    d = iter(dataloader)
-    for i in range(0,51) : 
-        model.zero_grad()
-        image_tensors, labels = next(d)
-        image = image_tensors.to(device)
-        save_image(image, 'img{}.png'.format(i))
-        batch_size = 1
-        preds = model(image,'')
-        preds_size = torch.IntTensor([preds.size(1)] * batch_size).to(device)
-        preds = preds.permute(1, 0, 2).log_softmax(2)
-        _, preds_index = preds.max(2)
-        preds_index = preds_index.transpose(1, 0).contiguous().view(-1)
-        result = converter.decode(preds_index.data, preds_size.data)
-        del preds, image, image_tensors, _, preds_index
-        print(" {} ".format(i).center(80, "#"))
-        print(result)
-
-                    
                     
 
 def gInit(opt):
@@ -181,6 +129,7 @@ def gInit(opt):
     if pO.HVD:
         hvd.init()
         torch.cuda.set_device(hvd.local_rank())
+    torch.cuda.set_device(-1)
 
     OnceExecWorker = (pO.HVD and hvd.rank() == 0) or (pO.DP)
     cudnn.benchmark = True
@@ -192,25 +141,38 @@ def rSeed(sd):
     torch.manual_seed(sd)
     torch.cuda.manual_seed(sd)
 
-if __name__ == '__main__':
+class Prediction():
+    def __init__(self):
+        self.parser = argparse.ArgumentParser()
+        self.parser.add_argument('--gin', default = 'poem/poem.gin')
+        self.opt = self.parser.parse_args()
+        gInit(self.opt)
+        self.opt.manualSeed = ginM('manualSeed')
+        self.opt.port = ginM('port')
+        if OnceExecWorker:
+            rSeed(self.opt.manualSeed)
+        self.opt.num_gpu = torch.cuda.device_count()
+        if pO.HVD:
+            self.opt.world_size = hvd.size()
+            self.opt.rank       = hvd.rank()
+    def predict(self, model, converter, filename):
+        dataset = ds_load.myLoadDS('','',single=True,lst=filename)
+        dataloader  = torch.utils.data.DataLoader(dataset, batch_size=1 , pin_memory=True, 
+                        num_workers = 16, sampler=None)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--gin', help='Gin config file')
-
-    opt = parser.parse_args()
-    gInit(opt)
-    opt.manualSeed = ginM('manualSeed')
-    opt.port = ginM('port')
-
-    if OnceExecWorker:
-        rSeed(opt.manualSeed)
-
-    opt.num_gpu = torch.cuda.device_count()
-    
-
-    if pO.HVD:
-        opt.world_size = hvd.size()
-        opt.rank       = hvd.rank()
-    
-    train(opt)
+        d = iter(dataloader)
+        model.zero_grad()
+        image_tensors, labels = next(d)
+        image = image_tensors.to(device)
+        batch_size = 1
+        preds = model(image,'')
+        preds_size = torch.IntTensor([preds.size(1)] * batch_size).to(device)
+        preds = preds.permute(1, 0, 2).log_softmax(2)
+        _, preds_index = preds.max(2)
+        preds_index = preds_index.transpose(1, 0).contiguous().view(-1)
+        result = converter.decode(preds_index.data, preds_size.data)
+        return result 
+                    
+    def config(self):
+        return train(self.opt)
     
